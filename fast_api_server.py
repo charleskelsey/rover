@@ -412,153 +412,160 @@ async def dispatch_rover(rover_id: int):
 @app.websocket("/ws/{rover_id}")
 async def websocket_endpoint(websocket: WebSocket, rover_id: int):
     await websocket.accept()
-    
-    # Check if rover exists
+
     if rover_id not in db.rovers:
-        await websocket.send_text(json.dumps({"error": "Rover not found"}))
+        await websocket.send_json({"status": "error", "message": "Rover not found"})
         await websocket.close()
         return
-    
+
     rover = db.rovers[rover_id]
-    
-    # Check if rover is in a valid state
-    if rover.status not in [RoverStatus.NOT_STARTED, RoverStatus.FINISHED]:
-        await websocket.send_text(json.dumps({"error": f"Rover is {rover.status}, cannot control"}))
-        await websocket.close()
-        return
-    
-    # Reset rover state for real-time control
-    rover.status = RoverStatus.MOVING
-    rover.position = RoverPosition(x=0, y=0, facing='S')  # Start at (0,0) facing South
-    rover.commands = ""
-    rover.executed_commands = ""
-    
-    direction_idx = 2  # Start facing South (index 2 in directions list)
+
+    if rover.status not in [RoverStatus.NOT_STARTED, RoverStatus.FINISHED, RoverStatus.MOVING]: # Allow if MOVING (e.g. previously dispatched but not finished)
+        # If rover was MOVING from a dispatch, we might want to interrupt that or handle it.
+        # For simplicity now, if it's ELIMINATED, we won't allow control.
+        if rover.status == RoverStatus.ELIMINATED:
+            await websocket.send_json({"status": "error", "message": f"Rover is {rover.status}, cannot control"})
+            await websocket.close()
+            return
+        # If it was MOVING from a prior dispatch, we'll override its command list
+        # and start fresh from its current position for real-time.
+        print(f"Rover {rover_id} was {rover.status}, taking over for real-time control.")
+
+
+    # --- MODIFICATION: Start from current rover state ---
+    rover.status = RoverStatus.MOVING # Set to MOVING for real-time session
+    # rover.commands = "" # Clear pre-programmed commands
+    rover.executed_commands = "" # Clear executed commands for this session
+
+    # Initialize direction_idx based on rover.position.facing
+    try:
+        direction_idx = directions.index(rover.position.facing)
+    except ValueError:
+        # Fallback if facing is somehow invalid, default to South
+        print(f"Warning: Rover {rover_id} had invalid facing '{rover.position.facing}'. Defaulting to South.")
+        rover.position.facing = 'S'
+        direction_idx = 2
+
+    # Initialize on_mine based on current position
     on_mine = False
-    
+    if db.is_valid_position(rover.position.x, rover.position.y) and \
+       db.grid[rover.position.y][rover.position.x] > 0:
+        on_mine = True
+    # --- END MODIFICATION ---
+
+    await websocket.send_json({ # Send initial state to client
+        "status": "connected",
+        "message": "Real-time control initiated.",
+        "roverId": rover.id,
+        "position": rover.position.dict(),
+        "onMine": on_mine
+    })
+
+
     try:
         while True:
             command = await websocket.receive_text()
-            
-            # Validate command
+            response_payload = {"command": command} # Start constructing response
+
             if command not in 'LRMD':
-                await websocket.send_json({
-                    "status": "error",
-                    "message": "Invalid command. Only L, R, M, D are allowed."
-                })
+                response_payload["status"] = "error"
+                response_payload["message"] = "Invalid command. Only L, R, M, D are allowed."
+                await websocket.send_json(response_payload)
                 continue
-            
+
             if command == 'L':
-                direction_idx = (direction_idx - 1) % 4
+                direction_idx = (direction_idx - 1 + 4) % 4 # Ensure positive modulo
                 rover.position.facing = directions[direction_idx]
-                await websocket.send_json({
-                    "status": "success",
-                    "command": "L",
-                    "newFacing": rover.position.facing
-                })
-                
+                response_payload["status"] = "success"
+                response_payload["newFacing"] = rover.position.facing
+                response_payload["position"] = rover.position.dict()
+
             elif command == 'R':
                 direction_idx = (direction_idx + 1) % 4
                 rover.position.facing = directions[direction_idx]
-                await websocket.send_json({
-                    "status": "success",
-                    "command": "R",
-                    "newFacing": rover.position.facing
-                })
-                
+                response_payload["status"] = "success"
+                response_payload["newFacing"] = rover.position.facing
+                response_payload["position"] = rover.position.dict()
+
             elif command == 'M':
-                # If we are on an active mine and try to move without disarming, we explode
                 if on_mine:
                     rover.status = RoverStatus.ELIMINATED
-                    await websocket.send_json({
-                        "status": "eliminated",
-                        "message": "Rover eliminated! Stepped on a mine without disarming"
-                    })
-                    break
-                
-                # Execute the move
+                    response_payload["status"] = "eliminated"
+                    response_payload["message"] = "Rover eliminated! Moved on an active mine."
+                    response_payload["position"] = rover.position.dict()
+                    await websocket.send_json(response_payload)
+                    break # End WebSocket session
+
                 dx, dy = direction_moves[rover.position.facing]
                 new_x = rover.position.x + dx
                 new_y = rover.position.y + dy
-                
-                # Check if move is valid
+
                 if db.is_valid_position(new_x, new_y):
                     rover.position.x = new_x
                     rover.position.y = new_y
-                    
+                    response_payload["status"] = "success"
+                    response_payload["newPosition"] = {"x": new_x, "y": new_y} # For clarity
+                    response_payload["position"] = rover.position.dict() # Send full new position object
+
                     # Check if landed on a mine
                     if db.grid[new_y][new_x] > 0:
                         on_mine = True
-                        await websocket.send_json({
-                            "status": "warning",
-                            "command": "M",
-                            "newPosition": {"x": new_x, "y": new_y},
-                            "message": "Rover is on a mine! Disarm it before moving."
-                        })
+                        response_payload["status"] = "warning" # Override status if on mine
+                        response_payload["message"] = "Rover moved onto a mine! Disarm before moving again."
+                        response_payload["onMine"] = True
                     else:
                         on_mine = False
-                        await websocket.send_json({
-                            "status": "success",
-                            "command": "M",
-                            "newPosition": {"x": new_x, "y": new_y}
-                        })
+                        response_payload["onMine"] = False
                 else:
-                    # Out of bounds, ignore move
-                    await websocket.send_json({
-                        "status": "error",
-                        "command": "M",
-                        "message": "Cannot move outside the map boundaries"
-                    })
-                    
+                    response_payload["status"] = "error"
+                    response_payload["message"] = "Cannot move outside map boundaries."
+                    response_payload["position"] = rover.position.dict() # Send current position
+
             elif command == 'D':
-                # Disarming command - only works if we are on an active mine
-                if on_mine and db.grid[rover.position.y][rover.position.x] > 0:
-                    # Find which mine is at this position
-                    mine_id = None
-                    for mid, mine in db.mines.items():
-                        if mine.x == rover.position.x and mine.y == rover.position.y:
-                            mine_id = mid
+                if on_mine and db.is_valid_position(rover.position.x, rover.position.y) and \
+                   db.grid[rover.position.y][rover.position.x] > 0:
+                    mine_at_pos_id = None
+                    for mid, m_obj in db.mines.items():
+                        if m_obj.x == rover.position.x and m_obj.y == rover.position.y:
+                            mine_at_pos_id = mid
                             break
                     
-                    if mine_id is not None:
-                        mine = db.mines[mine_id]
-                        pin = db.find_pin(mine.serial_number)
-                        
-                        # Disarm the mine
-                        if db.is_valid_position(mine.x, mine.y):
-                            db.grid[mine.y][mine.x] = 0
-                        
-                        # Remove the mine
-                        del db.mines[mine_id]
-                        
+                    if mine_at_pos_id is not None:
+                        mine_obj = db.mines[mine_at_pos_id]
+                        pin = db.find_pin(mine_obj.serial_number)
+                        db.grid[mine_obj.y][mine_obj.x] = 0 # Clear from grid
+                        del db.mines[mine_at_pos_id] # Remove from store
                         on_mine = False
-                        await websocket.send_json({
-                            "status": "success",
-                            "command": "D",
-                            "mineId": mine_id,
-                            "pin": pin,
-                            "message": "Mine successfully disarmed"
-                        })
-                    else:
-                        await websocket.send_json({
-                            "status": "error",
-                            "command": "D",
-                            "message": "Mine data inconsistency detected"
-                        })
+
+                        response_payload["status"] = "success"
+                        response_payload["mineIdDisarmed"] = mine_at_pos_id
+                        response_payload["pin"] = pin
+                        response_payload["message"] = f"Mine {mine_at_pos_id} successfully disarmed. PIN: {pin}"
+                        response_payload["onMine"] = False
+                    else: # Should not happen if on_mine is true and grid > 0
+                        response_payload["status"] = "error"
+                        response_payload["message"] = "Mine data inconsistency."
+                        response_payload["onMine"] = on_mine # Still on mine
                 else:
-                    # No mine to disarm
-                    await websocket.send_json({
-                        "status": "error",
-                        "command": "D",
-                        "message": "No mine to disarm at this position"
-                    })
-            
-            rover.executed_commands += command
-            
+                    response_payload["status"] = "error"
+                    response_payload["message"] = "No mine to disarm at this position."
+                    response_payload["onMine"] = on_mine
+
+                response_payload["position"] = rover.position.dict()
+
+
+            rover.executed_commands += command # Log executed command for this session
+            await websocket.send_json(response_payload)
+
     except WebSocketDisconnect:
-        if rover.status == RoverStatus.MOVING:
+        print(f"Client for rover {rover_id} disconnected during real-time control.")
+    finally:
+        # When WebSocket closes (disconnect or error), set rover status to FINISHED
+        # if it was MOVING due to this real-time session.
+        # The rover's position and facing are already updated.
+        if rover.status == RoverStatus.MOVING: # Check to avoid overriding ELIMINATED
             rover.status = RoverStatus.FINISHED
-        print(f"Client for rover {rover_id} disconnected")
+        print(f"Real-time control for rover {rover_id} ended. Final status: {rover.status}, Position: ({rover.position.x},{rover.position.y}) Facing: {rover.position.facing}")
 
 origins = [
     "http://localhost",         

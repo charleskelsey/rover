@@ -3,8 +3,7 @@ uvicorn fast_api_server:app --host localhost --port 8000 --reload
 
 bugs:
 
-- Not able to control the rover in real time. Need to fix
-  (Just tested. It will only show final position when you disconnect.
-  Update so that it updates graphically every move)
+- Not able to control the rover in real time.
+  (Just tested. It will only show final position when you disconnect.)
 
-- Change colors of the rover and mines to make it more visually appealing.
+- Check rover and mine interactions along with the Dig command.

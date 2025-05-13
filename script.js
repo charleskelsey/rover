@@ -1,13 +1,13 @@
 document.addEventListener("DOMContentLoaded", () => {
-  const API_URL = "http://localhost:8000"; // Your FastAPI server URL
+  const API_URL = "http://localhost:8000";
   let currentMap = [];
   let currentRovers = [];
   let currentMines = [];
   let selectedRoverId = null;
   let selectedMineId = null;
   let webSocket = null;
-  let mapWidth = 10; // Initial assumption, will be updated
-  let mapHeight = 10; // Initial assumption, will be updated
+  let mapWidth = 10;
+  let mapHeight = 10;
 
   // --- DOM Elements ---
   const mapGrid = document.getElementById("map-grid");
@@ -319,6 +319,30 @@ document.addEventListener("DOMContentLoaded", () => {
     renderMap(); // Update map to highlight selected rover potentially
   }
 
+  // --- Real-time Functions ---
+  function updateRealtimeRoverSelect() {
+    const currentVal = realtimeRoverSelect.value;
+    realtimeRoverSelect.innerHTML =
+      '<option value="">-- Select a Rover --</option>';
+    currentRovers.forEach((rover) => {
+      // Allow selection if rover is Not Started, Finished,
+      // or even MOVING (if we want to take over a dispatched rover)
+      // but NOT if ELIMINATED
+      if (rover.status !== "Eliminated") {
+        const option = document.createElement("option");
+        option.value = rover.id;
+        option.textContent = `Rover ${rover.id} (${rover.status} at ${rover.position.x},${rover.position.y} ${rover.position.facing})`;
+        realtimeRoverSelect.appendChild(option);
+      }
+    });
+    if (realtimeRoverSelect.querySelector(`option[value="${currentVal}"]`)) {
+      realtimeRoverSelect.value = currentVal;
+      realtimeControlPanel.classList.remove("hidden");
+    } else {
+      realtimeControlPanel.classList.add("hidden");
+    }
+  }
+
   async function createNewRover() {
     const commands = roverCommandsInput.value.trim().toUpperCase();
     if (!commands) {
@@ -620,20 +644,20 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function connectWebSocket() {
-    const roverId = realtimeRoverSelect.value;
-    if (!roverId) {
+    const roverIdStr = realtimeRoverSelect.value;
+    if (!roverIdStr) {
       logRealtime("Please select a rover first.", "error");
       return;
     }
+    const roverId = parseInt(roverIdStr); // Ensure it's a number for lookups
 
     if (webSocket && webSocket.readyState === WebSocket.OPEN) {
       logRealtime("Already connected.", "error");
       return;
     }
 
-    // Construct WebSocket URL (ws:// or wss://)
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${wsProtocol}//${window.location.host}/ws/${roverId}`; // Assumes API server host/port
+    const wsUrl = `${wsProtocol}//${window.location.host}/ws/${roverId}`;
 
     logRealtime(`Connecting to ${wsUrl}...`);
     webSocket = new WebSocket(wsUrl);
@@ -643,28 +667,73 @@ document.addEventListener("DOMContentLoaded", () => {
       btnConnectWs.classList.add("hidden");
       btnDisconnectWs.classList.remove("hidden");
       realtimeButtonsDiv.classList.remove("hidden");
-      realtimeRoverSelect.disabled = true; // Prevent changing rover while connected
+      realtimeRoverSelect.disabled = true;
     };
 
     webSocket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
         logRealtime(`Received: ${JSON.stringify(data)}`, "received");
-        // Handle specific responses (update map/rover state if needed)
-        if (data.status === "eliminated") {
-          alert(data.message);
-          disconnectWebSocket(); // Close connection on elimination
-          fetchRovers(); // Update rover status
+
+        // Find the rover in our local array
+        // Ensure roverId is a number for comparison if currentRovers[].id is number
+        const roverIdNum = parseInt(realtimeRoverSelect.value);
+        const roverToUpdate = currentRovers.find((r) => r.id === roverIdNum);
+
+        if (data.status === "connected" && roverToUpdate) {
+          roverToUpdate.position = data.position;
+          roverToUpdate.status = "Moving";
+          logRealtime(
+            `Rover ${data.roverId} started at (${data.position.x},${data.position.y}) facing ${data.position.facing}. On Mine: ${data.onMine}`
+          );
+          renderMap();
+          renderRoversList(); // Reflect "Moving" status in the main rover list
+          if (selectedRoverId === roverIdNum) selectRover(roverIdNum);
+          return;
         }
-        if (data.command === "D" && data.status === "success") {
-          fetchMines(); // Update map after digging
+
+        if (roverToUpdate && data.position) {
+          roverToUpdate.position = data.position;
         }
-        if (data.command === "M" && data.newPosition) {
-          // Potentially update a local rover position representation for map rendering
-          // For now, just log it
+        if (roverToUpdate && data.newFacing) {
+          roverToUpdate.position.facing = data.newFacing;
+        }
+
+        let shouldFetchMines = false; // Flag to fetch mines only once if needed
+
+        if (roverToUpdate && data.status) {
+          if (data.status === "eliminated") {
+            roverToUpdate.status = "Eliminated";
+            alert(data.message || "Rover has been eliminated!");
+            disconnectWebSocket();
+          } else if (data.status === "warning" && data.onMine) {
+            logRealtime(data.message || "Rover is on a mine!", "warning");
+          } else if (data.status === "success") {
+            if (data.command === "D" && data.mineIdDisarmed) {
+              logRealtime(
+                `Mine ${data.mineIdDisarmed} disarmed. PIN: ${data.pin}`,
+                "success"
+              );
+              shouldFetchMines = true; // Mark that mines need to be fetched
+            }
+          }
+        }
+
+        renderMap(); // Render immediately with local updates
+
+        if (shouldFetchMines) {
+          fetchMines(); // Fetch mines if a 'D' command was successful
+        }
+
+        if (selectedRoverId === roverIdNum && roverToUpdate) {
+          selectedRoverStatusSpan.textContent = roverToUpdate.status;
+          selectedRoverPositionSpan.textContent = roverToUpdate.position
+            ? `(${roverToUpdate.position.x}, ${roverToUpdate.position.y}) Facing ${roverToUpdate.position.facing}`
+            : "N/A";
         }
       } catch (e) {
-        logRealtime(`Received raw: ${event.data}`);
+        logRealtime(`Error processing message: ${e}`, "error");
+        logRealtime(`Received raw non-JSON: ${event.data}`);
       }
     };
 
@@ -680,7 +749,26 @@ document.addEventListener("DOMContentLoaded", () => {
       btnDisconnectWs.classList.add("hidden");
       realtimeButtonsDiv.classList.add("hidden");
       realtimeRoverSelect.disabled = false;
-      fetchRovers(); // Fetch rovers again as status might be 'Finished'
+
+      // Ensure roverId is captured before fetchRovers might change things
+      const closedRoverIdStr = realtimeRoverSelect.value; // Or capture it when connection starts
+
+      // Fetch rovers again to get the final status (e.g., FINISHED) from the server.
+      // This is important because the server's `finally` block updates status.
+      fetchRovers().then(() => {
+        // After rovers are fetched and currentRovers is updated:
+        renderRoversList(); // Refresh the main rover list
+        updateRealtimeRoverSelect(); // Refresh the dropdown as status/position changed
+
+        // If the rover that was being controlled is still the "selectedRoverId"
+        // in the main UI, re-select it to update its details panel.
+        if (
+          closedRoverIdStr &&
+          selectedRoverId === parseInt(closedRoverIdStr)
+        ) {
+          selectRover(parseInt(closedRoverIdStr));
+        }
+      });
     };
 
     webSocket.onerror = (event) => {
